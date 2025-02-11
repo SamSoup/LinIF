@@ -97,6 +97,7 @@ def tokenize_dataset(
             batched=True,
             remove_columns=column_names,
             desc="Tokenizing dataset",
+            load_from_cache_file=True,
         )
         if is_distributed:
             dist.barrier()  # Notify other processes

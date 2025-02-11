@@ -48,6 +48,12 @@ print(Analyzer.get_module_summary(model))
 * Optionally, run `inspect_examples.ipynb` with the appropriate scores and dataset loading code to inspect top influential examples
 for each query.
 
+
+Note: 
+
+Influence scores are very large in magnitude. Ideally, influence scores need to be divided by the total number of training data points. However, the code does not normalize the scores. If you would like, you can divide the scores with the total number of data points (or tokens for language modeling) used to train the model.
+
+
 ## Generating Outputs
 
 To accomodate free-text queries, we provide a `generate.py` to generation responses from a model and save it at a desired location as input to query the model. The expected run command is something like:

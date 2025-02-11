@@ -2,28 +2,6 @@
 Note: because this file requires some function in the module, you must call the
 function like follows:
 
-Example Usage:
-
-cd <directory right above the main directory>
-python -m DAForLinGen.experiments.compute_scores_babylm \
-    --model_name "kanishka/smolm-autoreg-bpe-seed_496" \
-    --module_type "attention_only" \
-    --train_dataset_path "/scratch/06782/ysu707/babylm_data/babylm_100M/aochildes.train" \
-    --eval_dataset_path "/work/06782/ysu707/ls6/DAForLinGen/data/datasets/subject_verb_agreement/output.json"  \
-    --start_index 0 \
-    --max_length 256 \
-    --analysis_name "full" \
-    --output_dir "/scratch/06782/ysu707/babylm" \
-    --factors_name "influence_factors" \
-    --scores_name "influence_scores_attn_correct" \
-    --train_batch_size 64 \
-    --per_device_query_batch_size 4 \
-    --profile \
-    --overwrite_output_dir \
-    --compute_per_module_scores \
-    --do_extreme_memory_save_for_llms \
-    --data_partitions 10
-
 For other layers, change to "fully_connected_only". Update `scores_name`
 to reflect as well.
 
@@ -46,11 +24,14 @@ from DAForLinGen.models.babylm import get_modules_for_babylm
 from DAForLinGen.models.utils import construct_llm
 from .task import (
     LanguageModelingTask,
+    LanguageModelingWithMarginMeasurementTask,
+    LanguageModelingWithContrastTokenTask,
 )
 from kronfluence.analyzer import Analyzer, prepare_model
 from kronfluence.utils.common.score_arguments import (
     extreme_reduce_memory_score_arguments,
 )
+from typing import List
 from kronfluence.utils.dataset import DataLoaderKwargs
 
 torch.backends.cudnn.benchmark = True
@@ -60,6 +41,23 @@ torch.backends.cuda.matmul.allow_tf32 = True
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Influence score computation on Openwebtext dataset."
+    )
+
+    # Task Arguments
+    parser.add_argument(
+        "--task_type",
+        type=str,
+        default="lm",
+        help="One of 'lm' for language model, 'margin', or 'lm_with_contrast_token'"
+        "see task.py for the different available tasks",
+    )
+    parser.add_argument(
+        "--contrast_token",
+        type=str,
+        default=None,
+        help="Specific for 'lm_with_contrast_token', specify the token with which"
+        "we like to compute the difference between the correct completion w.r.t"
+        "the specified contrast token (e.g., 'is' versus 'are')",
     )
 
     # Model Arguments
@@ -89,16 +87,28 @@ def parse_args():
         help="The dataset path to the query data with completion for Babylm.",
     )
     parser.add_argument(
-        "--start_index",
+        "--train_start_index",
         type=int,
         default=0,
-        help="The starting index for selecting the dataset subset.",
+        help="The starting index for selecting the pre-training dataset subset.",
     )
     parser.add_argument(
-        "--stop_index",
+        "--train_stop_index",
         type=int,
         default=None,
-        help="The stopping index for selecting the dataset subset. If None, includes all data from start_index.",
+        help="The stopping index for selecting the pre-training dataset subset. If None, includes all data from start_index.",
+    )
+    parser.add_argument(
+        "--eval_start_index",
+        type=int,
+        default=0,
+        help="The starting index for selecting the evaluation dataset subset.",
+    )
+    parser.add_argument(
+        "--eval_stop_index",
+        type=int,
+        default=None,
+        help="The stopping index for selecting the evaluation dataset subset. If None, includes all data from start_index.",
     )
     parser.add_argument(
         "--max_length",
@@ -147,12 +157,25 @@ def parse_args():
         help="Boolean flag to compute influence scores per module."
         "When False -- all modules must have the same factor shape",
     )
+    parser.add_argument(
+        "--compute_per_token_scores",
+        action="store_true",
+        default=False,
+        help="Boolean flag to compute influence scores per token."
+        "When False -- all modules must have the same factor shape",
+    )
 
     # Batch-hyperparameters
     parser.add_argument(
         "--do_extreme_memory_save_for_llms",
         action="store_true",
         help="Boolean flag to for use hyper-params to partition factor compute",
+    )
+    parser.add_argument(
+        "--module_partitions",
+        type=int,
+        default=4,
+        help="Module partitions.",
     )
     parser.add_argument(
         "--data_partitions",
@@ -194,6 +217,12 @@ def parse_args():
     )
     args = parser.parse_args()
 
+    if args.task_type == "lm_with_contrast_token":
+        if args.contrast_token is None:
+            raise ValueError(
+                "When doing language modeling with contrast token",
+                "the contrast token must be specified",
+            )
     return args
 
 
@@ -234,9 +263,23 @@ def main():
     logger.info(module_names)
     #####
 
-    # Define task and prepare the model
+    ##### NOTE: Select different task here, depending on desired behavior
     logger.info("Using LanguageModelingTask.")
-    task = LanguageModelingTask(module_fct=get_module_names_fct)
+    if args.task_type == "lm":
+        task = LanguageModelingTask(module_fct=get_module_names_fct)
+    elif args.task_type == "margin":
+        task = LanguageModelingWithMarginMeasurementTask(
+            module_fct=get_module_names_fct
+        )
+    elif args.task_type == "lm_with_contrast_token":
+        task = LanguageModelingWithContrastTokenTask(
+            module_fct=get_module_names_fct,
+            # first input id is always <start_of_seq>, so take 2nd token id
+            contrast_token_id=tokenizer(args.contrast_token)["input_ids"][1],
+        )
+
+    #####
+
     model = prepare_model(model, task)
     logger.info("Model preparation completed.")
 
@@ -251,31 +294,39 @@ def main():
 
     # Prepare the datasets
     logger.info("Preparing dataset.")
-    if args.stop_index is not None and args.stop_index <= args.start_index:
-        raise ValueError(
-            f"Invalid range: stop_index ({args.stop_index}) must be greater than start_index ({args.start_index})."
+
+    def compute_indices(start_index, stop_index) -> List[int]:
+        if stop_index is not None and stop_index <= start_index:
+            raise ValueError(
+                f"Invalid range: stop_index ({stop_index}) must be greater than start_index ({start_index})."
+            )
+        return (
+            list(range(start_index, stop_index))
+            if stop_index is not None
+            else None
         )
-    indices = (
-        list(range(args.start_index, args.stop_index))
-        if args.stop_index is not None
-        else None
-    )
+
     ##### NOTE: Dataset can be fairly verbose, change this section as needed
     train_dataset = load_babylm_aochildes(
         tokenizer=tokenizer,
         dataset_path=args.train_dataset_path,
         max_length=args.max_length,
-        indices=indices,
+        indices=compute_indices(args.train_start_index, args.train_stop_index),
     )
 
     eval_dataset = load_completion_dataset_generic(
         dataset_path=args.eval_dataset_path,
         tokenizer=tokenizer,
         max_length=args.max_length,
+        indices=compute_indices(args.eval_start_index, args.eval_stop_index),
     )
 
     data_collator = default_data_collator
+
+    logger.info(train_dataset)
+    logger.info(eval_dataset)
     #####
+
     logger.info("Dataset preparation completed.")
 
     # Use Accelerator to prepare the model for distributed training
@@ -311,7 +362,7 @@ def main():
         )
         score_args = extreme_reduce_memory_score_arguments(
             damping_factor=None,
-            module_partitions=4,
+            module_partitions=args.module_partitions,
             query_gradient_low_rank=rank,
             dtype=torch.bfloat16,
         )
@@ -325,6 +376,7 @@ def main():
     else:
         score_args = ScoreArguments(use_full_svd=True)
     score_args.compute_per_module_scores = args.compute_per_module_scores
+    score_args.compute_per_token_scores = args.compute_per_token_scores
 
     # Compute pairwise scores
     logger.info("Computing pairwise scores.")

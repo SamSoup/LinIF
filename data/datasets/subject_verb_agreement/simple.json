@@ -1,0 +1,26 @@
+[
+    {
+        "prompt": "",
+        "completion": "the toys on the table"
+    },
+    {
+        "prompt": "the toys on the table",
+        "completion": "are"
+    },
+    {
+        "prompt": "the toys on the table",
+        "completion": "is"
+    },
+    {
+        "prompt": "",
+        "completion": "i think the toy on the table"
+    },
+    {
+        "prompt": "i think the toy on the table",
+        "completion": "is"
+    },
+    {
+        "prompt": "i think the toy on the table",
+        "completion": "are"
+    }
+]
